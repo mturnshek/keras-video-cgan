@@ -12,11 +12,10 @@ from keras.optimizers import Adam
 import datetime
 import matplotlib.pyplot as plt
 import sys
-from data_loader import DataLoader
 import numpy as np
 import os
 
-from manage_data import load_data
+from data_scripts.data_loader import load_data
 
 class Pix2Pix():
     def __init__(self, load_weights=True):
@@ -26,41 +25,45 @@ class Pix2Pix():
         self.channels = 3
         self.img_shape = (self.img_rows, self.img_cols, self.channels)
 
-        # Configure data loader
-        # self.dataset_name = 'facades'
-        # self.data_loader = DataLoader(dataset_name=self.dataset_name,
-        #                               img_res=(self.img_rows, self.img_cols))
-
-        self.data_A, self.data_B = load_data()
+        self.data_B, self.data_A = load_data()
+        # Normalize pixels to be values between -1 and 1
         self.data_A = self.data_A/127.5 - 1
         self.data_B = self.data_B/127.5 - 1
 
         # Calculate output shape of D (PatchGAN)
         patch = int(self.img_rows / 2**4)
         self.disc_patch = (patch, patch, 1)
+        # this is basically the discriminator taking each 16x16 part
+        # of the image and condensing it into a single 'real' or 'fake'.
 
         # Number of filters in the first layer of G and D
         self.gf = 64
         self.df = 64
 
+        self.g_trains_per_d = 3
         optimizer = Adam(0.0002, 0.5)
 
-        # Build and compile the discriminator
-        self.discriminator = self.build_discriminator()
-        self.discriminator.compile(loss='mse',
+        # Build and compile the discriminators
+        self.discriminator1 = self.build_discriminator()
+        self.discriminator1.compile(loss='mse',
+            optimizer=optimizer,
+            metrics=['accuracy'])
+
+        # Two discriminators make the generations closer to the actual data
+        # instead of them preying on the blind spot of one disciminator
+        self.discriminator2 = self.build_discriminator()
+        self.discriminator2.compile(loss='mse',
             optimizer=optimizer,
             metrics=['accuracy'])
 
         # Build and compile the generator
         self.generator = self.build_generator()
         self.generator.compile(loss='binary_crossentropy', optimizer=optimizer)
-        # M: does the loss of this generator and its optimizer actually matter?
-        # M: it seems like it will never be trained by itself, no?
 
-        # M :
         if load_weights:
             self.generator.load_weights("saved_model/generator.hdf5")
-            self.discriminator.load_weights("saved_model/discriminator.hdf5")
+            self.discriminator1.load_weights("saved_model/discriminator1.hdf5")
+            self.discriminator2.load_weights("saved_model/discriminator2.hdf5")
 
         # Input images and their conditioning images
         img_A = Input(shape=self.img_shape)
@@ -68,24 +71,29 @@ class Pix2Pix():
 
         # By conditioning on B generate a fake version of A
         fake_A = self.generator(img_B)
-        # M: i don't quite understand what this line does ...
-        # M: self.generator is a model. by passing it img_B, which is an input ...
-        # M: i'm going to keep going for now and come back.
 
         # For the combined model we will only train the generator
-        self.discriminator.trainable = False
+        self.discriminator1.trainable = False
+        self.discriminator2.trainable = False
 
         # Discriminators determines validity of translated images / condition pairs
-        valid = self.discriminator([fake_A, img_B])
+        valid1 = self.discriminator1([fake_A, img_B])
+        valid2 = self.discriminator2([fake_A, img_B])
 
-        self.combined = Model([img_A, img_B], [valid, fake_A])
-        self.combined.compile(loss=['mse', 'mae'],
+        self.combined1 = Model([img_A, img_B], [valid1, fake_A])
+        self.combined1.compile(loss=['mse', 'mae'],
+                              loss_weights=[1, 100],
+                              optimizer=optimizer)
+
+        self.combined2 = Model([img_A, img_B], [valid2, fake_A])
+        self.combined2.compile(loss=['mse', 'mae'],
                               loss_weights=[1, 100],
                               optimizer=optimizer)
 
     def save_models(self):
         self.generator.save_weights('saved_model/generator.hdf5')
-        self.discriminator.save_weights('saved_model/discriminator.hdf5')
+        self.discriminator1.save_weights('saved_model/discriminator1.hdf5')
+        self.discriminator2.save_weights('saved_model/discriminator2.hdf5')
 
     def build_generator(self):
         """U-Net Generator"""
@@ -133,13 +141,6 @@ class Pix2Pix():
 
         return Model(d0, output_img)
 
-    # M: the generator seems to be fully deterministic - no noise input.
-    # M: why? what would the effects of adding noise be?
-    # M: would it be optimal for A) mario B) MCTSGAN
-    # M: it appears that in both cases, noise would actually be better.
-    # M: the way that this is being used now seems more like
-    # M: deterministic translation, rather than data point generation.
-
     def build_discriminator(self):
 
         def d_layer(layer_input, filters, f_size=4, bn=True):
@@ -165,54 +166,61 @@ class Pix2Pix():
 
         return Model([img_A, img_B], validity)
 
-    # batch size was 1
+    def sample(self, batch_size):
+        # Sample images and their conditioning counterparts
+        # TODO: sample without replacement
+        indices = np.random.randint(0, self.data_A.shape[0], batch_size)
+        imgs_A, imgs_B = self.data_A[indices], self.data_B[indices]
+        fake_A = self.generator.predict(imgs_B) # gen fakes from imgs_B
+
+        return imgs_A, imgs_B, fake_A
+
     def train(self, epochs, batch_size=5, save_interval=50):
 
         start_time = datetime.datetime.now()
 
         for epoch in range(epochs):
 
-            # ----------------------
-            #  Train Discriminator
-            # ----------------------
-
-            # Sample images and their conditioning counterparts
-            indices = np.random.randint(0, self.data_A.shape[0], batch_size)
-            imgs_A, imgs_B = self.data_A[indices], self.data_B[indices]
-            # imgs_A, imgs_B = self.data_loader.load_data(batch_size)
-
-            # Condition on B and generate a translated version
-            fake_A = self.generator.predict(imgs_B)
-
-            valid = np.ones((batch_size,) + self.disc_patch)
+            real = np.ones((batch_size,) + self.disc_patch)
             fake = np.zeros((batch_size,) + self.disc_patch)
 
-            # Train the discriminators (original images = real / generated = Fake)
-            d_loss_real = self.discriminator.train_on_batch([imgs_A, imgs_B], valid)
-            d_loss_fake = self.discriminator.train_on_batch([fake_A, imgs_B], fake)
-            d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+            # ----------------------
+            #  Train Discriminators
+            # ----------------------
+
+            imgs_A, imgs_B, fake_A = self.sample(batch_size)
+            # Train the first discriminator
+            d1_loss_real = self.discriminator1.train_on_batch([imgs_A, imgs_B], real)
+            d1_loss_fake = self.discriminator1.train_on_batch([fake_A, imgs_B], fake)
+            d1_loss = 0.5 * np.add(d1_loss_real, d1_loss_fake)
+
+            imgs_A, imgs_B, fake_A = self.sample(batch_size)
+            # Train the second discriminator
+            d2_loss_real = self.discriminator2.train_on_batch([imgs_A, imgs_B], real)
+            d2_loss_fake = self.discriminator2.train_on_batch([fake_A, imgs_B], fake)
+            d2_loss = 0.5 * np.add(d2_loss_real, d2_loss_fake)
 
             # ------------------
             #  Train Generator
             # ------------------
 
-            # Sample images and their conditioning counterparts
-            indices = np.random.randint(0, self.data_A.shape[0], batch_size)
-            imgs_A, imgs_B = self.data_A[indices], self.data_B[indices]
-            # imgs_A, imgs_B = self.data_loader.load_data(batch_size)
+            imgs_A, imgs_B, _ = self.sample(batch_size)
+            # Use a given discriminator with 50% chance each time.
+            # Sort of like how SGD tends to stabilize, I assume this will as well.
+            if (np.random.random() > 0.5):
+                g_loss = self.combined1.train_on_batch([imgs_A, imgs_B], [real, imgs_A])
+            else:
+                g_loss = self.combined2.train_on_batch([imgs_A, imgs_B], [real, imgs_A])
 
-            # The generators want the discriminators to label the generated images as real
-            valid = np.ones((batch_size,) + self.disc_patch)
-
-            # Train the generators
-            g_loss = self.combined.train_on_batch([imgs_A, imgs_B], [valid, imgs_A])
+            # ----------------
+            #   Log progress
+            # ----------------
 
             elapsed_time = datetime.datetime.now() - start_time
-            # Plot the progress
             print ("%d time: %s" % (epoch, elapsed_time))
-            print ("g loss:", g_loss, "d loss:", d_loss)
+            print ("g loss", g_loss, "\n", "d1 loss:", d1_loss, "d2_loss:", d2_loss)
 
-            # If at save interval => save generated image samples
+            # If at save interval => save generated image samples and models
             if epoch % save_interval == 0:
                 self.save_imgs(epoch)
                 self.save_models()
@@ -225,14 +233,12 @@ class Pix2Pix():
         indices = np.random.randint(0, self.data_A.shape[0], batch_size)
         imgs_A, imgs_B = self.data_A[indices], self.data_B[indices]
 
-        # imgs_A, imgs_B = self.data_loader.load_data(batch_size=3, is_testing=True)
         fake_A = self.generator.predict(imgs_B)
 
         gen_imgs = np.concatenate([imgs_B, fake_A, imgs_A])
 
         # Rescale images 0 - 255
         gen_imgs = (gen_imgs + 1) * 127.5
-        # gen_imgs = 0.5 * gen_imgs + 0.5
 
         titles = ['Condition', 'Generated', 'Original']
         fig, axs = plt.subplots(r, c)
@@ -248,6 +254,5 @@ class Pix2Pix():
 
 
 if __name__ == '__main__':
-    gan = Pix2Pix(load_weights=True)
-    # batch size was 1
+    gan = Pix2Pix(load_weights=False)
     gan.train(epochs=999999, batch_size=8, save_interval=200)
